@@ -94,6 +94,11 @@ async def _job_intimacao(paj_norm: str, emit) -> dict:
         "etapa": "firac",
         "arquivo": res_pecas.get("arquivo"),
         "chars_ocr": res_pecas.get("chars_ocr"),
+        # Propaga o desfecho parcial (peças vieram do Painel por falta de
+        # habilitação nos autos) para a UI sinalizar ao defensor.
+        "via": res_pecas.get("via"),
+        "parcial": res_pecas.get("parcial"),
+        "sem_habilitacao": res_pecas.get("sem_habilitacao"),
         "gerada_em": res_firac.get("gerada_em"),
         "erro": res_firac.get("erro"),
     }

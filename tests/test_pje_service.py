@@ -137,6 +137,78 @@ def test_extrair_expedientes_filtra_linhas_relevantes():
     assert all("irrelevante" not in ln for ln in linhas)
 
 
+# --- fallback sem habilitação (Painel do Defensor) --------------------------------
+
+class _FakeMcp:
+    """MCP fake: só implementa listar_expedientes, gravando as chamadas."""
+    def __init__(self, resposta: dict):
+        self._resposta = resposta
+        self.chamadas: list[tuple[int, str]] = []
+
+    def listar_expedientes(self, situacao: int = 1, numero_processo: str = "") -> dict:
+        self.chamadas.append((situacao, numero_processo))
+        return self._resposta
+
+
+_NUM = "5001690-86.2026.4.03.6130"
+
+
+def test_expedientes_via_painel_encontra_por_numero():
+    mcp = _FakeMcp({"numeros_processo": [_NUM],
+                    "conteudo_raw": "Intimação (58218565) — prazo de 15 dias"})
+    out = pje_service._expedientes_via_painel(mcp, _NUM, lambda _l: None)
+    assert "prazo de 15 dias" in out
+    assert mcp.chamadas[0][0] == 1  # começa pela situação 1 (pendentes)
+
+
+def test_expedientes_via_painel_vazio_quando_processo_ausente():
+    mcp = _FakeMcp({"numeros_processo": ["9999999-99.2020.4.03.6100"],
+                    "conteudo_raw": "expediente de outro processo"})
+    out = pje_service._expedientes_via_painel(mcp, _NUM, lambda _l: None)
+    assert out == ""
+
+
+def test_puxar_sem_habilitacao_grava_digest_e_preserva_flag(paj_tmp, tmp_path):
+    paj = paj_tmp({
+        "processo_judicial": _NUM,
+        "pje_intimacao_pendente": {"data": "2026-06-01", "prazo_dias": 15},
+    })
+    mcp = _FakeMcp({"numeros_processo": [_NUM],
+                    "conteudo_raw": "Intimação (58218565) — prazo de 15 dias"})
+    res = pje_service._puxar_pecas_sem_habilitacao(
+        paj, _NUM, mcp, "erro original", lambda _l: None)
+    assert res["ok"] is True
+    assert res["parcial"] is True
+    assert res["sem_habilitacao"] is True
+    assert res["via"] == "painel_expedientes"
+    digest = (tmp_path / paj / "_situacao_pje.md").read_text(encoding="utf-8")
+    assert "58218565" in digest
+    assert "NÃO baixados" in digest
+    # flag de intimação PRESERVADO — o defensor ainda precisa agir
+    meta = json.loads((tmp_path / paj / "metadata.json").read_text(encoding="utf-8"))
+    assert "pje_intimacao_pendente" in meta
+    assert "pje_pecas_puxadas_em" not in meta
+
+
+def test_puxar_sem_habilitacao_sem_expediente_devolve_erro(paj_tmp):
+    paj = paj_tmp({"processo_judicial": _NUM})
+    mcp = _FakeMcp({"numeros_processo": [], "conteudo_raw": ""})
+    res = pje_service._puxar_pecas_sem_habilitacao(
+        paj, _NUM, mcp, "erro original", lambda _l: None)
+    assert res["ok"] is False
+    assert res["sem_habilitacao"] is True
+    assert res["erro"] == "erro original"
+
+
+def test_situacao_sem_habilitacao_devolve_expedientes():
+    mcp = _FakeMcp({"numeros_processo": [_NUM],
+                    "conteudo_raw": "Intimação (58218565)\nPrazo: 15 dias"})
+    res = pje_service._situacao_sem_habilitacao(_NUM, mcp, "erro", lambda _l: None)
+    assert res["ok"] is True
+    assert res["sem_habilitacao"] is True
+    assert any("58218565" in ln for ln in res["expedientes"])
+
+
 # --- trava de concorrência ---------------------------------------------------------
 
 def test_lock_rejeita_operacao_concorrente(paj_tmp, monkeypatch):

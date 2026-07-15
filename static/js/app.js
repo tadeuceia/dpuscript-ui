@@ -578,8 +578,14 @@ function puxarPecasPje(pajNorm) {
                 }
                 return;
             }
-            logEl.textContent += 'Peças baixadas: ' + (res.arquivo || '') + ' (' + (res.tamanho || 0) + ' bytes)\n';
-            logEl.textContent += 'OCR: ' + (res.chars_ocr || 0) + ' caracteres. Digest _situacao_pje.md gravado.\n';
+            if (res.via === 'painel_expedientes') {
+                logEl.textContent += '⚠ Autos completos NÃO baixados — você não está habilitado nos autos.\n';
+                logEl.textContent += 'Capturei a intimação/expediente pelo Painel do Defensor (' + (res.chars_ocr || 0) + ' caracteres).\n';
+                logEl.textContent += 'Para as peças integrais, use "Solicitar habilitação" no PJe.\n';
+            } else {
+                logEl.textContent += 'Peças baixadas: ' + (res.arquivo || '') + ' (' + (res.tamanho || 0) + ' bytes)\n';
+                logEl.textContent += 'OCR: ' + (res.chars_ocr || 0) + ' caracteres. Digest _situacao_pje.md gravado.\n';
+            }
             logEl.textContent += 'Pronto para análise — recarregando a página...\n';
             logEl.scrollTop = logEl.scrollHeight;
             showToast('Peças do PJe prontas — recarregando', 'success');
@@ -613,6 +619,11 @@ function puxarEAnalisarPje(pajNorm) {
                 }
                 logEl.scrollTop = logEl.scrollHeight;
                 return;
+            }
+            if (res.via === 'painel_expedientes') {
+                logEl.textContent += '⚠ Autos completos NÃO baixados (sem habilitação nos autos). '
+                    + 'A análise FIRAC usou a intimação/expediente do Painel do Defensor. '
+                    + 'Para as peças integrais, use "Solicitar habilitação" no PJe.\n';
             }
             logEl.textContent += 'Peças baixadas + análise FIRAC concluída. Abrindo a Situação do PAJ...\n';
             logEl.scrollTop = logEl.scrollHeight;

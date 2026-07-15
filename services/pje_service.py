@@ -159,9 +159,44 @@ def _login_e_resolver(numero: str, emit: Callable[[str], None]) -> dict:
     emit(f"Resolvendo processo {numero} ...")
     res = mcp.consultar_processo_numero(numero)
     if not res.get("encontrado"):
+        # Devolve `mcp` mesmo em falha: o login já valeu e a sessão está quente,
+        # então o caller pode tentar a porta do Painel do Defensor (fallback de
+        # falta de habilitação nos autos) sem reautenticar.
         return {"erro": res.get("erro", "processo não encontrado"),
-                "sem_habilitacao": bool(res.get("sem_habilitacao"))}
+                "sem_habilitacao": bool(res.get("sem_habilitacao")),
+                "mcp": mcp}
     return {"mcp": mcp, "idp": res["id_processo"]}
+
+
+# Situações do Painel do Defensor que ainda importam para uma intimação viva:
+# 1 = pendentes de ciência ou resposta; 3 = ciência dada, pendente de resposta;
+# 6 = sem prazo. Tentadas nesta ordem até o processo aparecer.
+_SITUACOES_EXPEDIENTE = (1, 3, 6)
+
+
+def _expedientes_via_painel(mcp, numero: str, emit: Callable[[str], None]) -> str:
+    """Conteúdo do expediente/intimação pela porta do Painel do Defensor.
+
+    Essa porta (`advogado.seam`) é liberada pela PRÓPRIA intimação e NÃO exige
+    habilitação nos autos — ao contrário da Consulta Processual, que é onde o
+    `consultar_processo_numero` esbarra em "não habilitado". Devolve o texto do
+    expediente (pode incluir outros pendentes) ou "" se nada for encontrado.
+    """
+    listar = getattr(mcp, "listar_expedientes", None)
+    if listar is None:
+        emit("[aviso] Painel de expedientes indisponível nesta versão do MCP.")
+        return ""
+    for sit in _SITUACOES_EXPEDIENTE:
+        try:
+            r = listar(situacao=sit, numero_processo=numero)
+        except Exception as e:
+            emit(f"[aviso] expedientes (situação {sit}): {type(e).__name__}: {e}")
+            continue
+        nums = r.get("numeros_processo") or []
+        conteudo = (r.get("conteudo_raw") or "").strip()
+        if conteudo and (numero in nums or numero in conteudo):
+            return conteudo
+    return ""
 
 
 def _expedientes_do_processo(mcp, idp: str, numero: str,
@@ -221,7 +256,10 @@ def _situacao_processual_locked(paj_norm: str, numero: str,
                                 emit: Callable[[str], None]) -> dict:
     sessao = _login_e_resolver(numero, emit)
     if "erro" in sessao:
-        return {"ok": False, **sessao}
+        if sessao.get("sem_habilitacao"):
+            return _situacao_sem_habilitacao(
+                numero, sessao.get("mcp"), sessao["erro"], emit)
+        return {"ok": False, "erro": sessao["erro"]}
     mcp, idp = sessao["mcp"], sessao["idp"]
     emit(f"Processo aberto (id {idp}). Lendo expedientes e movimentações...")
 
@@ -241,6 +279,20 @@ def _situacao_processual_locked(paj_norm: str, numero: str,
         "ok": True, "numero": numero, "id_processo": idp,
         "expedientes": expedientes, "movimentos": movimentos, "documentos": documentos,
     }
+
+
+def _situacao_sem_habilitacao(numero: str, mcp, erro_orig: str,
+                              emit: Callable[[str], None]) -> dict:
+    """Fallback da 'Situação Processual' sem habilitação nos autos: lê o
+    expediente pelo Painel do Defensor e devolve como `expedientes`."""
+    conteudo = _expedientes_via_painel(mcp, numero, emit) if mcp else ""
+    if not conteudo:
+        return {"ok": False, "erro": erro_orig, "sem_habilitacao": True}
+    emit("Expediente obtido pelo Painel do Defensor (sem habilitação nos autos).")
+    linhas = [ln.strip() for ln in conteudo.splitlines() if ln.strip()]
+    return {"ok": True, "numero": numero, "sem_habilitacao": True,
+            "via": "painel_expedientes", "expedientes": linhas[:60],
+            "movimentos": [], "documentos": []}
 
 
 def puxar_pecas(paj_norm: str, emit: Callable[[str], None]) -> dict:
@@ -264,7 +316,10 @@ def _puxar_pecas_locked(paj_norm: str, numero: str,
                         emit: Callable[[str], None]) -> dict:
     sessao = _login_e_resolver(numero, emit)
     if "erro" in sessao:
-        return {"ok": False, **sessao}
+        if sessao.get("sem_habilitacao"):
+            return _puxar_pecas_sem_habilitacao(
+                paj_norm, numero, sessao.get("mcp"), sessao["erro"], emit)
+        return {"ok": False, "erro": sessao["erro"]}
     mcp, idp = sessao["mcp"], sessao["idp"]
 
     pasta = PAJS_DIR / paj_norm
@@ -310,3 +365,43 @@ def _puxar_pecas_locked(paj_norm: str, numero: str,
     return {"ok": True, "numero": numero, "arquivo": dl.get("arquivo"),
             "tamanho": dl.get("tamanho"), "expedientes": expedientes,
             "chars_ocr": len(texto)}
+
+
+def _puxar_pecas_sem_habilitacao(paj_norm: str, numero: str, mcp,
+                                 erro_orig: str,
+                                 emit: Callable[[str], None]) -> dict:
+    """Fallback quando o usuário NÃO está habilitado nos autos.
+
+    A Consulta Processual não abre os autos, mas a intimação libera a porta do
+    Painel do Defensor. Captura ali o texto do expediente/intimação e grava o
+    digest `_situacao_pje.md`, para a análise FIRAC não ficar cega. NÃO baixa os
+    autos completos (isso exige habilitação) e NÃO limpa o flag de intimação —
+    o defensor ainda precisa agir e, se quiser as peças integrais, solicitar
+    habilitação no processo.
+    """
+    emit("Sem habilitação nos autos pela Consulta Processual — tentando o "
+         "Painel do Defensor (a intimação libera essa porta)...")
+    conteudo = _expedientes_via_painel(mcp, numero, emit) if mcp else ""
+    if not conteudo:
+        emit("Painel do Defensor também não retornou o expediente.")
+        return {"ok": False, "erro": erro_orig, "sem_habilitacao": True}
+
+    pasta = PAJS_DIR / paj_norm
+    quando = _dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+    linhas = [
+        f"# Situação do processo no PJe — {numero}", "",
+        f"_Capturado em {quando} pelo Painel do Defensor (expedientes)._", "",
+        "> ⚠ **Autos completos NÃO baixados.** O usuário não está habilitado nos "
+        "autos deste processo pela Consulta Processual do PJe. O conteúdo abaixo "
+        "é o expediente/intimação do Painel do Defensor (porta que a própria "
+        "intimação libera) e pode incluir outros expedientes pendentes. Para "
+        "baixar as peças integrais, solicite habilitação no processo "
+        "('Solicitar habilitação' no PJe).", "",
+        "## Expediente / intimação (Painel do Defensor)", "",
+        conteudo,
+    ]
+    (pasta / "_situacao_pje.md").write_text("\n".join(linhas) + "\n", encoding="utf-8")
+    emit("Intimação capturada pelo Painel (autos completos exigem habilitação).")
+    return {"ok": True, "numero": numero, "parcial": True,
+            "sem_habilitacao": True, "via": "painel_expedientes",
+            "arquivo": None, "chars_ocr": len(conteudo)}
